@@ -40,6 +40,12 @@ void isr();
 // RF GPIO IN
 int interruptPin = -1;
 
+// Latest pulse time
+volatile unsigned int duration;
+
+// Indicates the availability of a pulse time to read in raw mode
+volatile bool new_duration = false;
+
 unsigned int RFControl::getPulseLengthDivider() {
   return PULSE_LENGTH_DIVIDER;
 }
@@ -121,11 +127,12 @@ void RFControl::continueReceiving() {
 }
 
 unsigned int RFControl::getLastDuration(){
-	return 0;
+  new_duration = false;
+  return duration;
 }
 
 bool RFControl::existNewDuration(){
-	return 0;
+  return new_duration;
 }
 
 void isr()
@@ -136,6 +143,8 @@ void isr()
   byte lowPulse = digitalRead(interruptPin + 2);
 
   lastTime = now;
+  duration = pulseTime;
+  new_duration = true;
   
   if (periods == 0) {
     // Noise, ignore message
