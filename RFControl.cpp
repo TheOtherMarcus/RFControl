@@ -4,59 +4,58 @@
 #include "arduino_functions.h"
 #endif
 
-#define STATUS_WAITING 0
-#define STATUS_RECORDING_0 1
-#define STATUS_RECORDING_1 2
-#define STATUS_RECORDING_2 3
-#define STATUS_RECORDING_3 4
-#define STATUS_RECORDING_END 5
-
+// Scale down time by 4 to fit in 16 bit unsigned int
 #define PULSE_LENGTH_DIVIDER 4
 
-#define MIN_FOOTER_LENGTH (3500 / PULSE_LENGTH_DIVIDER)
-#define MIN_PULSE_LENGTH (100 / PULSE_LENGTH_DIVIDER)
+// Noise filter
+#define MIN_MSG_LEN 16
 
-unsigned int footer_length;
-unsigned int timings[MAX_RECORDINGS];
-unsigned long lastTime = 0;
-unsigned char state;
-unsigned int duration = 0;
+// Max length of data pulse. Longer pulses are treated as sync.
+#define MAX_PULSE_PERIODS 20
+
+// Minimum signal period time for a proper message
+#define MIN_PERIOD_TIME (120 / PULSE_LENGTH_DIVIDER)
+
+// Remembers the time of the last interrupt
+volatile unsigned int lastTime;
+
+// Pulse period time of message being received
+volatile unsigned int periodTime;
+
+// Pulse counter for message being received
+volatile byte streak;
+
+// Buffer pointer where the next message will be stored
+volatile byte writer;
+
+// Buffer pointer for the message reader
+volatile byte reader;
+
+// Circular message buffer (256) and extended raw buffer
+volatile unsigned int msgbuf[MAX_RECORDINGS];
+
+// Interrupt Service Routine
+void isr();
+
+// RF GPIO IN
 int interruptPin = -1;
-int data_start[5];
-int data_end[5];
-bool Pack0EqualPack1 = false;
-bool Pack0EqualPack2 = false;
-bool Pack0EqualPack3 = false;
-bool Pack1EqualPack2 = false;
-bool Pack1EqualPack3 = false;
-bool data1_ready = false;
-bool data2_ready = false;
-bool skip = false;
-bool new_duration = false;
-void handleInterrupt();
 
 unsigned int RFControl::getPulseLengthDivider() {
   return PULSE_LENGTH_DIVIDER;
 }
 
 void RFControl::startReceiving(int _interruptPin) {
-  footer_length = 0;
-  state = STATUS_WAITING;
-  data_end[0] = 0;
-  data_end[1] = 0;
-  data_end[2] = 0;
-  data_end[3] = 0;
-  data_start[0] = 0;
-  data_start[1] = 0;
-  data_start[2] = 0;
-  data_start[3] = 0; 
-  data1_ready = false;
-  data2_ready = false;
+  lastTime = micros() / 4;
+  periodTime = 0;
+  writer = 0;
+  reader = 0;
+  streak = 0;
+  
   if(interruptPin != -1) {
     hw_detachInterrupt(interruptPin);   
   }
   interruptPin = _interruptPin;
-  hw_attachInterrupt(interruptPin, handleInterrupt);
+  hw_attachInterrupt(interruptPin, isr);
 }
 
 void RFControl::stopReceiving() {
@@ -64,269 +63,127 @@ void RFControl::stopReceiving() {
     hw_detachInterrupt(interruptPin);   
   }
   interruptPin = -1;
-  state = STATUS_WAITING;
 }
 
 bool RFControl::hasData() {
-  return (data1_ready || data2_ready);
+  return writer != reader;
 }
 
+/* Message capture writes to a circular buffer, but the RFControl API
+   is not compatible with such a construction. getRaw() unfolds the
+   message into a linear sequence in memory. The circular buffer uses
+   256 words, but msgbuf is typically larger than that. If the message
+   wraps around, the words beyond index 255 is used for the unfolded
+   message.
+   
+   A captured message starts with a one word header containing the
+   average period time. After that follows the number of periods for
+   each pulse in the message. getRaw() removes the header and
+   multiplies the pulse periods with the period time to covert to the
+   correct RFControl API message format.
+ */
 void RFControl::getRaw(unsigned int **buffer, unsigned int* timings_size) {
-  if (data1_ready){
-    *buffer = &timings[0];
-    *timings_size = data_end[0] + 1;
-    data1_ready = false;
+  static unsigned int size;
+  unsigned int start = reader;
+  unsigned int max_size = MAX_RECORDINGS - reader;
+  byte pos = 0;
+  size = 0;
+  if (reader != writer) {
+    unsigned int pt = msgbuf[(byte)(reader + pos++)];
+    while ((byte)(reader+pos) != writer && msgbuf[(byte)(reader+pos)] <= MAX_PULSE_PERIODS && size < max_size) {
+      msgbuf[start + size++] = pt * msgbuf[(byte)(reader + pos++)];
+    }
+    if (size >= max_size) {
+      // Unable to fit message from circular buffer in flat buffer. Drop message
+      size = 0;
+    }
+    else if ((reader+pos) != writer) {
+      // Include sync at end
+      msgbuf[start + size++] = pt * msgbuf[(byte)(reader + pos++)];      
+    }
   }
-  else if (data2_ready)
-  {
-    *buffer = &timings[data_start[1]];
-    *timings_size = data_end[1] - data_start[1] + 1;
-    data2_ready = false;
-  }
+  *timings_size = size;
+  *buffer = (unsigned int*)&msgbuf[start];
 }
 
 void RFControl::continueReceiving() {
-  if(state == STATUS_RECORDING_END)
-  {
-    state = STATUS_WAITING;
-    data1_ready = false;
-    data2_ready = false;
+  if (reader != writer) {
+    // Go to next message
+    reader++;
+    while (reader != writer && msgbuf[reader] <= MAX_PULSE_PERIODS) {
+      reader++;
+    }
+    if (reader != writer) {
+      // Include sync at end
+      reader++;
+    }
   }
 }
 
 unsigned int RFControl::getLastDuration(){
-	new_duration = false;
-	return duration;
+	return 0;
 }
 
 bool RFControl::existNewDuration(){
-	return new_duration;
+	return 0;
 }
 
-bool probablyFooter(unsigned int duration) {
-  return duration >= MIN_FOOTER_LENGTH; 
-}
+void isr()
+{
+  unsigned int now = micros() / PULSE_LENGTH_DIVIDER;
+  unsigned int pulseTime = now - lastTime;
+  unsigned int periods = (pulseTime + periodTime/2) / periodTime;
+  byte lowPulse = digitalRead(interruptPin + 2);
 
-bool matchesFooter(unsigned int duration) {
-  unsigned int footer_delta = footer_length/4;
-  return (footer_length - footer_delta < duration && duration < footer_length + footer_delta);
-}
+  lastTime = now;
+  
+  if (periods == 0) {
+    // Noise, ignore message
+    streak = 0;
+  }
+  if (streak > 0) {
+    // Receive message
+    byte index = (writer + streak++);
+    if (index == reader) {
+      // Reception buffer is full, drop message
+      streak = 0;
+    }
+    else {
+      msgbuf[index] = periods;
+    }
+  }
 
-void startRecording(unsigned int duration) {
-  #ifdef RF_CONTROL_SIMULATE_ARDUINO
-  printf(" => start recoding");
-  #endif
-  footer_length = duration;
-  data_end[0] = 0;
-  data_end[1] = 0;
-  data_end[2] = 0;
-  data_end[3] = 0;
-  data_start[0] = 0;
-  data_start[1] = 0;
-  data_start[2] = 0;
-  data_start[3] = 0;
-  Pack0EqualPack3 = true;
-  Pack1EqualPack3 = true;
-  Pack0EqualPack2 = true;
-  Pack1EqualPack2 = true;
-  Pack0EqualPack1 = true;
-  data1_ready = false;
-  data2_ready = false;
-  state = STATUS_RECORDING_0;
-}
-
-void recording(unsigned int duration, int package) {
-#ifdef RF_CONTROL_SIMULATE_ARDUINO
-  //nice string builder xD
-  printf("%s:", sate2string[state]);
-  if (data_end[package] < 10)
-    printf(" rec_pos=  %i", data_end[package]);
-  else if (data_end[package] < 100)
-    printf(" rec_pos= %i", data_end[package]);
-  else if (data_end[package] < 1000)
-    printf(" rec_pos=%i", data_end[package]);
-  int pos = data_end[package] - data_start[package];
-  if (pos < 10)
-    printf(" pack_pos=  %i", pos);
-  else if (pos < 100)
-    printf(" pack_pos= %i", pos);
-  else if (pos < 1000)
-    printf(" pack_pos=%i", pos);
-
-  if (duration < 10)
-    printf(" duration=    %i", duration);
-  else if (duration < 100)
-    printf(" duration=   %i", duration);
-  else if (duration < 1000)
-    printf(" duration=  %i", duration);
-  else if (duration < 10000)
-    printf(" duration= %i", duration);
-  else if (duration < 100000)
-    printf(" duration=%i", duration);
-#endif
-  if (matchesFooter(duration)) //test for footer (+-25%).
-  {
-    //Package is complete!!!!
-    timings[data_end[package]] = duration;
-    data_start[package + 1] = data_end[package] + 1;
-    data_end[package + 1] = data_start[package + 1];
-
-    //Received more than 16 timings and start and end are the same footer then enter next state
-    //less than 16 timings -> restart the package.
-    if (data_end[package] - data_start[package] >= 16)
-    {
-      if (state == STATUS_RECORDING_3) {
-        state = STATUS_RECORDING_END;
-      }else
-      {
-        state = STATUS_RECORDING_0 + package + 1;
+  if (lowPulse) {
+    if (periodTime > MIN_PERIOD_TIME && periods > MAX_PULSE_PERIODS) {
+      // Sync detected
+      if (streak > MIN_MSG_LEN) {
+        // Message complete
+        msgbuf[writer] = periodTime;
+        writer = (writer + streak);
+      }
+      // Start new message
+      streak = 1;
+    }
+  }
+  else {
+    // high pulse
+    if (periods > MAX_PULSE_PERIODS) {
+      // Noise, ignore message
+      streak = 0;
+    }
+    if (streak > 0) {
+      if (periods == 1) {
+        // Approximate average of single period high pulses in message
+        periodTime = (periodTime*streak + 2*pulseTime) / (streak + 2);
       }
     }
-    else
-    {
-      #ifdef RF_CONTROL_SIMULATE_ARDUINO
-        printf(" => restart package");
-      #endif
-      data_end[package] = data_start[package];
-      switch (package)
-      {
-        case 0:
-          startRecording(duration); //restart
-          break;
-        case 1:
-          Pack0EqualPack1 = true;
-          break;
-        case 2:
-          Pack0EqualPack2 = true;
-          Pack1EqualPack2 = true;
-          break;
-        case 3:
-          Pack0EqualPack3 = true;
-          Pack1EqualPack3 = true;
-          break;
-      }
-    }
-  }
-  else
-  {
-    //duration isnt a footer? this is the way.
-    //if duration higher than the saved footer then the footer isnt a footer -> restart.
-    if (duration > footer_length)
-    {
-      startRecording(duration);
-    }
-    //normal
-    else if (data_end[package] < MAX_RECORDINGS - 1)
-    {
-      timings[data_end[package]] = duration;
-      data_end[package]++;
-    }
-    //buffer reached end. Stop recording.
-    else
-    {
-      state = STATUS_WAITING;
+    else {
+      // Initiate search for new period time and sync
+      periodTime = pulseTime;
     }
   }
 }
 
-
-
-void verify(bool *verifiystate, bool *datastate, unsigned int refVal_max, unsigned int refVal_min, int pos, int package){
-  if (*verifiystate && pos >= 0)
-  {
-    unsigned int mainVal = timings[pos];
-    if (refVal_min > mainVal || mainVal > refVal_max)
-    {
-      //werte passen nicht
-      *verifiystate = false;
-    }
-    #ifdef RF_CONTROL_SIMULATE_ARDUINO
-    printf(" - verify = %s", *verifiystate ? "true" : "false");
-    #endif
-    if (state == (STATUS_RECORDING_0 + package + 1) && *verifiystate == true)
-    {
-      #ifdef RF_CONTROL_SIMULATE_ARDUINO
-      printf("\nPackage are equal.");
-      #endif
-      *datastate = true;
-    }
-  }
-}
-
-void verification(int package) {
-  int refVal = timings[data_end[package] - 1];
-  int delta = refVal / 8 + refVal / 4; //+-37,5%
-  int refVal_min = refVal - delta;
-  int refVal_max = refVal + delta;
-  int pos = data_end[package] - 1 - data_start[package];
-
-  switch (package)
-  {
-  case 1:
-    verify(&Pack0EqualPack1, &data1_ready, refVal_max, refVal_min, pos, package);
-    break;
-  case 2:
-    verify(&Pack0EqualPack2, &data1_ready, refVal_max, refVal_min, pos, package);
-    verify(&Pack1EqualPack2, &data2_ready, refVal_max, refVal_min, pos, package);
-    if (state == STATUS_RECORDING_3 && data1_ready == false && data2_ready == false) {
-      state = STATUS_WAITING;
-    }
-    break;
-  case 3:
-    if (!Pack0EqualPack2)
-      verify(&Pack0EqualPack3, &data1_ready, refVal_max, refVal_min, pos, package);
-    if (!Pack1EqualPack2)
-      verify(&Pack1EqualPack3, &data2_ready, refVal_max, refVal_min, pos, package);
-    if (state == STATUS_RECORDING_END && data1_ready == false && data2_ready == false) {
-      state = STATUS_WAITING;
-    }
-    break;
-  }
-}
-
-void handleInterrupt() {
-  //hw_digitalWrite(9, HIGH);
-  unsigned long currentTime = hw_micros();
-  duration = (currentTime - lastTime) / PULSE_LENGTH_DIVIDER;
-  //lastTime = currentTime;
-  if (skip) {
-    skip = false;
-    return;
-  }
-  if (duration >= MIN_PULSE_LENGTH)
-  {
-	new_duration = true;
-    lastTime = currentTime; 
-    switch (state)
-    {
-    case STATUS_WAITING:
-      if (probablyFooter(duration))
-        startRecording(duration);
-      break;
-    case STATUS_RECORDING_0:
-      recording(duration, 0);
-      break;
-    case STATUS_RECORDING_1:
-      recording(duration, 1);
-      verification(1);
-      break;
-    case STATUS_RECORDING_2:
-      recording(duration, 2);
-      verification(2);
-      break;
-    case STATUS_RECORDING_3:
-      recording(duration, 3);
-      verification(3);
-      break;
-    }
-  }
-  else
-    skip = true;
-  //hw_digitalWrite(9, LOW);
-  #ifdef RF_CONTROL_SIMULATE_ARDUINO
-  printf("\n");
-  #endif
-}
 
 bool RFControl::compressTimings(unsigned int buckets[8], unsigned int *timings, unsigned int timings_size) {
   for(int j = 0; j < 8; j++ ) {
@@ -480,7 +337,7 @@ void listenBeforeTalk()
   if(interruptPin != -1) {
       waited += 500;
       hw_delayMicroseconds(500); 
-    while(state > STATUS_RECORDING_0 && state != STATUS_RECORDING_END) {
+    while(streak > 0) {
       //wait till no rf message is in the air
       waited += 5;
       hw_delayMicroseconds(3); // 5 - some micros for other stuff
@@ -490,27 +347,21 @@ void listenBeforeTalk()
       }
       // some delay between the message in air and the new message send
       // there could be additional repeats following so wait some more time
-      if(state <= STATUS_RECORDING_0 || state == STATUS_RECORDING_END) {
-        waited += 1000000;
-        hw_delayMicroseconds(1000000);
+      if(streak == 0) {
+        waited += periodTime * MAX_PULSE_PERIODS;
+        hw_delayMicroseconds(periodTime * MAX_PULSE_PERIODS);
       }
     }
     // stop receiving while sending, this method preserves the recording state
     hw_detachInterrupt(interruptPin);   
   }
-  // this prevents loosing the data in the receiving buffer, after sending
-  if(data1_ready || data2_ready) {
-    state = STATUS_RECORDING_END;
-  }
-  // Serial.print(waited);
-  // Serial.print(" ");
 }
 
 void afterTalk()
 {
   // enable reciving again
   if(interruptPin != -1) {
-    hw_attachInterrupt(interruptPin, handleInterrupt);
+    hw_attachInterrupt(interruptPin, isr);
   }
 }
 

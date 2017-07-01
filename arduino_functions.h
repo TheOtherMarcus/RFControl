@@ -10,7 +10,7 @@
   #define MAX_RECORDINGS 512  // ESP8266 has far enough ram
 #endif
 #if !defined(MAX_RECORDINGS)
-  #define MAX_RECORDINGS 255   // fallback for undefined Processor.
+  #define MAX_RECORDINGS 256   // fallback for undefined Processor.
 #endif
 
 static inline void hw_attachInterrupt(int pin, void (*callback)(void)) {
