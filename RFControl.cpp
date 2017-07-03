@@ -2,6 +2,8 @@
 
 #ifndef RF_CONTROL_VARDUINO
 #include "arduino_functions.h"
+#else
+#define byte uint8_t
 #endif
 
 // Scale down time by 4 to fit in 16 bit unsigned int
@@ -51,7 +53,7 @@ unsigned int RFControl::getPulseLengthDivider() {
 }
 
 void RFControl::startReceiving(int _interruptPin) {
-  lastTime = micros() / 4;
+  lastTime = hw_micros() / 4;
   periodTime = 0;
   writer = 0;
   reader = 0;
@@ -137,7 +139,7 @@ bool RFControl::existNewDuration(){
 
 void isr()
 {
-  unsigned int now = micros() / PULSE_LENGTH_DIVIDER;
+  unsigned int now = hw_micros() / PULSE_LENGTH_DIVIDER;
   unsigned int pulseTime = now - lastTime;
   unsigned int periods = (pulseTime + periodTime/2) / periodTime;
   byte lowPulse = digitalRead(interruptPin + 2);
