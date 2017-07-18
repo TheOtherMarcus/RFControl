@@ -53,7 +53,7 @@ unsigned int RFControl::getPulseLengthDivider() {
 }
 
 void RFControl::startReceiving(int _interruptPin) {
-  lastTime = hw_micros() / 4;
+  lastTime = hw_micros() / PULSE_LENGTH_DIVIDER;
   periodTime = 0;
   writer = 0;
   reader = 0;
